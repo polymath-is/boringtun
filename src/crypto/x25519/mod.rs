@@ -1,17 +1,23 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+//! Elliptic-curve Diffie-Hellman exchange over Curve25519.
+
 mod tests;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::make_array;
 use base64::decode;
-#[cfg(not(target_arch = "arm"))]
-use ring::rand::*;
 use std::ops::Add;
 use std::ops::Mul;
 use std::ops::Sub;
 use std::str::FromStr;
+
+#[cfg(not(target_arch = "arm"))]
+use ring::rand::*;
+
+const MASK_63BITS: u128 = 0x7fff_ffff_ffff_ffff;
+const MASK_64BITS: u128 = 0xffff_ffff_ffff_ffff;
 
 #[cfg(target_arch = "arm")]
 #[allow(non_snake_case)]
@@ -43,29 +49,14 @@ pub mod SystemRandom {
 
 #[repr(C)]
 #[derive(Debug)]
-/// A secret X25519 key
+/// A secret X25519 key.
 pub struct X25519SecretKey {
-    internal: [u8; 32],
-}
-
-#[repr(C)]
-#[derive(Debug)]
-/// An ephemeral X25519 key. Ideally should only be used once, but because WG uses the same ephemeral
-/// key twice, it is essentially identical to a secret key
-pub struct X25519EphemeralKey {
-    internal: X25519SecretKey,
-}
-
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq, Hash)]
-/// A public X25519, derived from a secret key
-pub struct X25519PublicKey {
     internal: [u8; 32],
 }
 
 #[allow(clippy::new_without_default)]
 impl X25519SecretKey {
-    /// Generate a new secret key using the OS rng
+    /// Generate a new secret key using the OS rng.
     pub fn new() -> Self {
         let rng = SystemRandom::new();
         let mut private_key = [0u8; 32];
@@ -75,14 +66,14 @@ impl X25519SecretKey {
         }
     }
 
-    /// Compute the public key for this secret key
+    /// Compute the public key for this secret key.
     pub fn public_key(&self) -> X25519PublicKey {
         X25519PublicKey {
             internal: x25519_public_key(&self.internal[..]),
         }
     }
 
-    /// Derive a shared key from a secret key of one peer and a public key of another
+    /// Derive a shared key from the secret key of this peer and the public key of a remote peer.
     pub fn shared_key(&self, peer_public: &X25519PublicKey) -> Result<[u8; 32], WireGuardError> {
         let shared_key = x25519_shared_key(&peer_public.internal[..], &self.internal[..]);
 
@@ -92,6 +83,7 @@ impl X25519SecretKey {
         Ok(shared_key)
     }
 
+    /// Return the private key represented as a byte array.
     pub fn as_bytes(&self) -> &[u8] {
         &self.internal[..]
     }
@@ -99,7 +91,8 @@ impl X25519SecretKey {
 
 impl FromStr for X25519SecretKey {
     type Err = &'static str;
-    /// Can parse a secret key from a hex or base64 encoded string
+
+    /// Can parse a secret key from a hex or base64 encoded string.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut key = X25519SecretKey {
             internal: [0u8; 32],
@@ -137,17 +130,26 @@ impl Drop for X25519SecretKey {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, PartialEq, Eq, Hash)]
+/// A public X25519, derived from a secret key.
+pub struct X25519PublicKey {
+    internal: [u8; 32],
+}
+
 impl X25519PublicKey {
-    pub fn is_equal_constant_time(&self, other: &X25519PublicKey) -> Result<(), WireGuardError> {
+    // Check if this public key is equal to `other` in constant-time.
+    pub fn constant_time_is_equal(&self, other: &X25519PublicKey) -> Result<(), WireGuardError> {
         constant_time_key_compare(&self.internal[..], &other.internal[..], true)
     }
 
+    // Return the public key represented as a byte array.
     pub fn as_bytes(&self) -> &[u8] {
         &self.internal[..]
     }
 }
 
-/// Will panic if the slice.len() != 32
+/// Will panic if the slice.len() != 32.
 impl<'a> From<&'a [u8]> for X25519PublicKey {
     fn from(slice: &[u8]) -> Self {
         let mut internal = [0u8; 32];
@@ -160,23 +162,6 @@ impl Drop for X25519PublicKey {
     fn drop(&mut self) {
         // Force zero out of the memory on Drop
         unsafe { std::ptr::write_volatile(&mut self.internal, [0u8; 32]) }
-    }
-}
-
-#[allow(clippy::new_without_default)]
-impl X25519EphemeralKey {
-    pub fn new() -> Self {
-        X25519EphemeralKey {
-            internal: X25519SecretKey::new(),
-        }
-    }
-
-    pub fn public_key(&self) -> X25519PublicKey {
-        self.internal.public_key()
-    }
-
-    pub fn shared_key(&self, peer_public: &X25519PublicKey) -> Result<[u8; 32], WireGuardError> {
-        self.internal.shared_key(peer_public)
     }
 }
 
@@ -555,13 +540,38 @@ fn mod_final_25519(x: Felem) -> Felem {
     let mut acc3 = u128::from(x.0[3]);
 
     let mut top = acc3 >> 63;
-    acc3 &= 0x7fff_ffff_ffff_ffff;
-
+    acc3 &= MASK_63BITS;
     top = top.wrapping_mul(19);
     acc0 = acc0.wrapping_add(top);
     acc1 = acc1.wrapping_add(acc0 >> 64);
     acc2 = acc2.wrapping_add(acc1 >> 64);
     acc3 = acc3.wrapping_add(acc2 >> 64);
+
+    // Mask
+    acc0 &= MASK_64BITS;
+    acc1 &= MASK_64BITS;
+    acc2 &= MASK_64BITS;
+    acc3 &= MASK_64BITS;
+
+    // At this point, acc{0-3} is in the range between 0 and 2^255 + 18, inclusively. It's not
+    // under 2^255 - 19 yet. So we are doing another round of modulo operation.
+
+    top = acc0.wrapping_add(19) >> 64;
+    top = acc1.wrapping_add(top) >> 64;
+    top = acc2.wrapping_add(top) >> 64;
+    top = acc3.wrapping_add(top) >> 63;
+    top = top.wrapping_mul(19);
+
+    // top is 19 if acc{0-3} is between 2^255 - 19 and 2^255 + 18, inclusively. Otherwise, it's
+    // zero.
+
+    acc0 = acc0.wrapping_add(top);
+    acc1 = acc1.wrapping_add(acc0 >> 64);
+    acc2 = acc2.wrapping_add(acc1 >> 64);
+    acc3 = acc3.wrapping_add(acc2 >> 64);
+    acc3 &= MASK_63BITS;
+
+    // Now acc{0-3} is between 0 and 2^255 - 20, inclusively.
 
     Felem([acc0 as u64, acc1 as u64, acc2 as u64, acc3 as u64])
 }
@@ -697,6 +707,7 @@ fn x25519_shared_key(peer_key: &[u8], secret_key: &[u8]) -> [u8; 32] {
 }
 
 // Compare two 32 byte keys for equality.
+//
 // eq = true indicates we compare for equality (Err if not equal)
 // eq = false indicates we compare for inequality (Err if equal)
 fn constant_time_key_compare(key1: &[u8], key2: &[u8], eq: bool) -> Result<(), WireGuardError> {
@@ -716,7 +727,7 @@ fn constant_time_key_compare(key1: &[u8], key2: &[u8], eq: bool) -> Result<(), W
     }
 }
 
-// Check if the slice is 32 byte long and is all zeroes
+// Check if the slice is 32 byte long and is all zeroes.
 fn constant_time_zero_key_check(key: &[u8]) -> Result<(), WireGuardError> {
     if key.len() != 32 {
         return Err(WireGuardError::WrongKey);
